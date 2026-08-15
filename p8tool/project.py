@@ -2,6 +2,8 @@
 
     p8project.json      manifest (cart name, header, version, tab order)
     src/NN_name.lua     one file per PICO-8 code tab, ordered by the NN prefix
+    src/**/*.lua        anything else under src/ is a library, pulled into a tab
+                        with `#include` and inlined on the way into the cart
     gfx/sprites.png     the 128x128 sprite sheet, 8-bit indexed PICO-8 palette
     gfx/flags.txt       one hex byte of sprite flags per sprite
     map/map.txt         the top 32 map rows, one hex byte per tile
@@ -17,11 +19,15 @@ import os
 import re
 
 from . import cart as cartmod
+from . import include
 from . import palette
 from . import png
 
 MANIFEST = "p8project.json"
 STATE_DIR = ".p8tool"
+
+SRC_DIR = "src"
+IGNORED_DIRS = {".git", "__pycache__"}
 
 SPRITES_PNG = os.path.join("gfx", "sprites.png")
 FLAGS_TXT = os.path.join("gfx", "flags.txt")
@@ -110,11 +116,11 @@ class Project:
     # ---------------------------------------------------------------- explode
 
     def unpack(self, cart):
-        """Write every part of `cart` out as an editable file."""
+        """Write every part of `cart` out as an editable file. Returns warnings."""
         self.manifest["header"] = cart.header
         self.manifest["version"] = cart.version
 
-        self._write_tabs(cart.tabs())
+        warnings = self._write_tabs(cart.tabs())
         self._write_gfx(cart.gfx())
         self._write_flags(cart.flags())
         self._write_map(cart.map_tiles())
@@ -124,16 +130,23 @@ class Project:
         self._write_extra(cart)
 
         self.save_manifest()
+        return warnings
 
     def _write_tabs(self, tabs):
-        src = self.path("src")
+        src = self.path(SRC_DIR)
         os.makedirs(src, exist_ok=True)
         existing = self._tab_files()
 
         names = []
+        warnings = []
         for i, body in enumerate(tabs):
             name = existing[i] if i < len(existing) else "%02d.lua" % i
             names.append(name)
+            # Included code goes back to the file it came from, so an edit made
+            # inside PICO-8 lands there rather than in the tab that pulled it in.
+            body, w = include.collapse(body, src, src, self._write_include,
+                                       origin=os.path.join(SRC_DIR, name))
+            warnings += w
             # Always add the file-terminating newline; _read_tabs strips exactly
             # one back off, so a tab ending in a blank line survives the trip.
             _write_if_changed(os.path.join(src, name), body + "\n")
@@ -146,9 +159,34 @@ class Project:
                 pass
 
         self.manifest["tabs"] = names
+        return warnings
+
+    def include_files(self):
+        """Every file under src/ that is not a code tab, root-relative and sorted.
+
+        These are the libraries a tab can `#include`. A tab reaching one is
+        enough to make it part of the cartridge, so a change to one is a change
+        to the project - even the ones nothing includes yet, which is how a new
+        library file gets noticed at all.
+        """
+        src = self.path(SRC_DIR)
+        if not os.path.isdir(src):
+            return []
+        tabs = set(self._tab_files())
+        found = []
+        for dirpath, dirnames, filenames in os.walk(src):
+            dirnames[:] = [d for d in dirnames
+                           if d not in IGNORED_DIRS and not d.startswith(".")]
+            for name in filenames:
+                if name.startswith(".") or (dirpath == src and name in tabs):
+                    continue
+                rel = os.path.relpath(os.path.join(dirpath, name), self.root)
+                found.append(rel.replace(os.sep, "/"))
+        found.sort()
+        return found
 
     def _tab_files(self):
-        src = self.path("src")
+        src = self.path(SRC_DIR)
         if not os.path.isdir(src):
             return []
         found = []
@@ -242,7 +280,9 @@ class Project:
         warnings = []
         c = cartmod.Cart(self.manifest["header"], int(self.manifest["version"]))
 
-        c.set_tabs(self._read_tabs())
+        tabs, warn = self._read_tabs()
+        warnings += warn
+        c.set_tabs(tabs)
 
         pixels, warn = self._read_gfx()
         warnings += warn
@@ -271,17 +311,37 @@ class Project:
         return c, warnings
 
     def _read_tabs(self):
-        src = self.path("src")
+        """The tab bodies, with every `#include` inlined. Returns (tabs, warnings)."""
+        src = self.path(SRC_DIR)
         files = self._tab_files()
         if not files:
-            return [""]
-        out = []
+            return [""], []
+        out, warnings = [], []
         for name in files:
             body = _read(os.path.join(src, name)).replace("\r\n", "\n")
             if body.endswith("\n"):
                 body = body[:-1]
+            body, w = include.expand(body, src, src, _read,
+                                     origin=os.path.join(SRC_DIR, name),
+                                     reject=self._reject_include)
+            warnings += w
             out.append(body)
-        return out
+        return out, warnings
+
+    # --------------------------------------------------------------- includes
+
+    def _reject_include(self, path):
+        """Why `path` may not be included, or None if it may."""
+        src = self.path(SRC_DIR)
+        if os.path.dirname(os.path.abspath(path)) == os.path.abspath(src):
+            if _TAB_RE.match(os.path.basename(path)):
+                return ("is a code tab already - tabs are joined automatically, "
+                        "so it must not also be included")
+        return None
+
+    def _write_include(self, path, text):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        _write_if_changed(path, text)
 
     def _read_image(self, path, width, height):
         img = png.read(path)

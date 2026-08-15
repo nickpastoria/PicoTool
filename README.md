@@ -77,6 +77,7 @@ mygame/
   p8project.json     cart name, header, PICO-8 version, tab order
   src/00.lua         one file per PICO-8 code tab
   src/01_player.lua  rename freely - the NN prefix sets the tab order
+  src/lib/vec.lua    a library - no NN prefix, so not a tab: `#include` it
   gfx/sprites.png    128x128 sprite sheet, 8-bit indexed PICO-8 palette
   gfx/flags.txt      sprite flags, one hex byte per sprite
   map/map.txt        map rows 0-31, one hex byte per tile
@@ -96,6 +97,61 @@ Each PICO-8 tab is one `.lua` file. Order comes from the numeric filename prefix
 so `git mv src/01.lua src/01_player.lua` is a rename, not a rewrite. Add a tab
 with `p8 tab new player`, or just create `src/02_enemies.lua` yourself. Delete a
 tab in PICO-8 and the file goes away on the next sync.
+
+### Libraries: `#include`
+
+A tab can pull in any other file under `src/`, so shared code lives in its own
+file instead of being pasted into whichever tab needed it:
+
+```lua
+-- src/00.lua
+#include lib/vec.lua
+
+function _init() p = vec(64, 64) end
+```
+
+```lua
+-- src/lib/vec.lua
+function vec(x, y) return {x = x, y = y} end
+```
+
+`p8 pack` resolves that itself, before PICO-8 ever sees the cart — the library's
+code is compiled straight into the tab. Paths are relative to the file holding
+the directive, and includes can nest.
+
+This is deliberately **not** PICO-8's own `#include`. PICO-8 resolves those as
+the cart loads, and only reaches files inside its own carts folder, so a cart in
+`build/` cannot see `src/` at all. Nor does that code ever enter PICO-8's editor,
+which means anything you changed in there would have nowhere to go on the way
+back out.
+
+Resolving it here fixes both. In the built cartridge the region is fenced with
+marker comments:
+
+```lua
+--#include lib/vec.lua
+function vec(x, y) return {x = x, y = y} end
+--#end lib/vec.lua
+```
+
+so unpacking can read it in reverse: the body goes back to `src/lib/vec.lua` and
+the region collapses to the one-line directive again. **Edit a library function
+inside PICO-8 and the change lands in the library file**, not in the tab that
+included it. Both directions are fixed points, so the watcher still settles.
+
+Some details worth knowing:
+
+- Includes must resolve to a file under `src/` — that is the tree p8tool watches,
+  so a library outside it would be source no change ever reached. A path leading
+  elsewhere is refused with a warning.
+- A file that cannot be resolved — missing, circular, or naming a tab, which is
+  already concatenated for you — keeps its directive line untouched and warns.
+  Nothing is silently dropped.
+- Including the same file from two tabs inlines it twice, exactly as writing it
+  twice would. There are no include guards.
+- Markers cost two comment lines per include. Comments are free in PICO-8's token
+  budget, and count only against the character limit.
+- `p8 status` lists the library files it can see.
 
 ### Sprites
 
