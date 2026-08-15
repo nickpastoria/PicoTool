@@ -10,6 +10,7 @@ import tempfile
 import time
 
 from . import cart as cartmod
+from . import hotkey
 from . import pico8
 from . import sync as syncmod
 from . import template
@@ -229,11 +230,11 @@ def cmd_run(args):
         report(syncer.tick(prefer="src"))
         exe = pico8.locate(project.manifest.get("pico8"))
         return pico8.run(exe, ["-run", project.cart_path], wait=True)
-    return _watch_loop(syncer, project, launch=True,
-                       interval=args.interval, reload_=not args.no_reload)
+    return _watch_loop(syncer, project, launch=True, interval=args.interval,
+                       reload_=not args.no_reload, in_place=not args.relaunch)
 
 
-def _watch_loop(syncer, project, launch, interval, reload_):
+def _watch_loop(syncer, project, launch, interval, reload_, in_place=True):
     proc = None
     exe = None
     if launch:
@@ -242,25 +243,50 @@ def _watch_loop(syncer, project, launch, interval, reload_):
     out("watching %s" % project.root)
     out("  cart: %s" % project.manifest["cart"])
     if launch:
-        out("  pico-8: %s%s" % (exe, "  (auto-relaunch on edit)" if reload_ else ""))
+        how = "reload in place" if in_place else "relaunch"
+        out("  pico-8: %s%s" % (exe, "  (auto-%s on edit)" % how if reload_ else ""))
     out("  edit files here, or save inside PICO-8 with Ctrl-S - both directions sync")
     out("  Ctrl-C to stop")
     out()
 
+    def start():
+        nonlocal proc
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        proc = subprocess.Popen([exe, "-run", project.cart_path], **kwargs)
+
     def relaunch():
         nonlocal proc
-        if not launch:
-            return
         if proc is not None and proc.poll() is None:
             proc.kill()
             try:
                 proc.wait(timeout=3)
             except Exception:
                 pass
-        kwargs = {}
-        if sys.platform == "win32":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        proc = subprocess.Popen([exe, "-run", project.cart_path], **kwargs)
+        start()
+
+    fell_back = False
+
+    def refresh():
+        """Pick the new cart up in the window that is already open, if we can."""
+        nonlocal fell_back
+        if not launch:
+            return
+        if proc is None or proc.poll() is not None:
+            start()
+            return
+        if in_place:
+            try:
+                # PICO-8 re-reads a cart that changed on disk when it gets
+                # Ctrl-R, which keeps the window exactly where it is.
+                hotkey.send_reload(proc.pid)
+                return
+            except hotkey.HotkeyError as exc:
+                if not fell_back:
+                    warn("could not reload in place (%s) - relaunching instead" % exc)
+                    fell_back = True
+        relaunch()
 
     reported_conflict = False
     try:
@@ -272,7 +298,7 @@ def _watch_loop(syncer, project, launch, interval, reload_):
         else:
             report(result, "[%s] " % _stamp())
         syncer.changed_since_last_look()
-        relaunch()
+        refresh()
 
         while True:
             time.sleep(interval)
@@ -302,7 +328,7 @@ def _watch_loop(syncer, project, launch, interval, reload_):
 
             report(result, "[%s] " % _stamp())
             if result.kind == syncmod.PACKED and reload_:
-                relaunch()
+                refresh()
             # Refresh the fingerprint so our own writes do not re-trigger.
             syncer.changed_since_last_look()
     except KeyboardInterrupt:
@@ -479,7 +505,9 @@ def build_parser():
     s = sub.add_parser("run", help="build, launch PICO-8, and sync continuously")
     s.add_argument("--interval", type=float, default=0.4, help="poll interval in seconds")
     s.add_argument("--no-reload", action="store_true",
-                   help="do not relaunch PICO-8 when the code changes")
+                   help="do not reload PICO-8 when the code changes")
+    s.add_argument("--relaunch", action="store_true",
+                   help="restart PICO-8 on each change instead of reloading it in place")
     s.add_argument("--no-watch", action="store_true", help="just launch PICO-8 once")
     s.set_defaults(func=cmd_run)
 
