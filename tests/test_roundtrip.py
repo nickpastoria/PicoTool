@@ -69,6 +69,17 @@ def _slurp(path):
         return fh.read()
 
 
+def _write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+
+
+def _append(path, text):
+    with open(path, "a", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+
+
 class TempProject:
     def __init__(self, text=None, name="probe"):
         self.text = text
@@ -271,6 +282,52 @@ class SyncTests(unittest.TestCase):
             for _ in range(3):
                 self.assertEqual("idle", s.tick().kind)
 
+    def test_included_file_edit_rebuilds_the_cart(self):
+        with TempProject(make_busy_cart()) as project:
+            s = Syncer(project)
+            _write(project.path("src", "lib", "util.lua"),
+                   "function lerp(a,b,t) return a+(b-a)*t end\n")
+            _append(project.path("src", "00.lua"), "\n#include lib/util.lua\n")
+            s.force_pack()
+            self.assertIn("function lerp", _slurp(project.cart_path))
+
+            _write(project.path("src", "lib", "util.lua"),
+                   "function lerp(a,b,t) return a+(b-a)*t*2 end\n")
+            self.assertEqual("packed", s.tick().kind)
+            self.assertIn("(b-a)*t*2", _slurp(project.cart_path))
+            self.assertEqual("idle", s.tick().kind)
+
+    def test_unreferenced_src_file_does_not_touch_the_cart(self):
+        """A library nothing includes yet is tracked, but rebuilds nothing."""
+        with TempProject(make_busy_cart()) as project:
+            s = Syncer(project)
+            s.force_pack()
+            before = _slurp(project.cart_path)
+
+            _write(project.path("src", "lib", "util.lua"), "-- not included yet\n")
+            self.assertEqual(["src/lib/util.lua"], project.include_files())
+
+            result = s.tick()
+            self.assertEqual("idle", result.kind)
+            self.assertEqual(before, _slurp(project.cart_path))
+            self.assertTrue(any("did not" in w for w in result.warnings))
+            self.assertEqual([], s.tick().warnings)
+
+    def test_reverse_sync_survives_included_files(self):
+        """An edit inside PICO-8 still wins cleanly when helper files exist."""
+        with TempProject(make_busy_cart()) as project:
+            s = Syncer(project)
+            with open(project.path("src", "shared.lua"), "w",
+                      encoding="utf-8", newline="\n") as fh:
+                fh.write("-- shared\n")
+            s.force_pack()
+            text = _slurp(project.cart_path)
+            with open(project.cart_path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text.replace("-- tab one", "-- tab one, from pico-8"))
+            self.assertEqual("unpacked", s.tick().kind)
+            self.assertEqual("idle", s.tick().kind)
+            self.assertIn("-- shared", _slurp(project.path("src", "shared.lua")))
+
     def test_no_ping_pong_after_reverse_sync(self):
         """A save from PICO-8 must not bounce back and re-trigger a pack."""
         with TempProject(make_busy_cart()) as project:
@@ -282,6 +339,128 @@ class SyncTests(unittest.TestCase):
             self.assertEqual("unpacked", s.tick().kind)
             self.assertEqual("idle", s.tick().kind)
             self.assertEqual("idle", s.tick().kind)
+
+
+class IncludeTests(unittest.TestCase):
+    """`#include` is resolved on the way into the cart and undone on the way out."""
+
+    def setup(self, project, tab="\n#include lib/util.lua\n",
+              util="function lerp(a,b,t) return a+(b-a)*t end\n"):
+        _write(project.path("src", "lib", "util.lua"), util)
+        _append(project.path("src", "00.lua"), tab)
+        return project.pack()
+
+    def test_include_is_inlined_and_marked(self):
+        with TempProject(make_busy_cart()) as project:
+            cart, warnings = self.setup(project)
+            text = cart.to_text()
+            self.assertEqual([], warnings)
+            self.assertIn("--#include lib/util.lua", text)
+            self.assertIn("function lerp(a,b,t) return a+(b-a)*t end", text)
+            self.assertIn("--#end lib/util.lua", text)
+            # The directive itself must not survive: PICO-8 would try to
+            # resolve it again, against a carts folder that has no such file.
+            self.assertNotIn("\n#include lib/util.lua", text)
+
+    def test_unpacking_collapses_it_again(self):
+        with TempProject(make_busy_cart()) as project:
+            cart, _ = self.setup(project)
+            os.remove(project.path("src", "lib", "util.lua"))
+
+            project.unpack(cartmod.Cart.parse(cart.to_text()))
+
+            self.assertIn("#include lib/util.lua", _slurp(project.path("src", "00.lua")))
+            self.assertNotIn("function lerp", _slurp(project.path("src", "00.lua")))
+            self.assertIn("function lerp", _slurp(project.path("src", "lib", "util.lua")))
+
+    def test_pack_unpack_is_a_fixed_point(self):
+        with TempProject(make_busy_cart()) as project:
+            before = self.setup(project)[0].to_text()
+            tab_before = _slurp(project.path("src", "00.lua"))
+            util_before = _slurp(project.path("src", "lib", "util.lua"))
+
+            project.unpack(cartmod.Cart.parse(before))
+
+            self.assertEqual(tab_before, _slurp(project.path("src", "00.lua")))
+            self.assertEqual(util_before, _slurp(project.path("src", "lib", "util.lua")))
+            self.assertEqual(before, project.pack()[0].to_text())
+
+    def test_edit_inside_the_region_lands_in_the_library(self):
+        """The whole point: code changed in PICO-8 goes back where it came from."""
+        with TempProject(make_busy_cart()) as project:
+            text = self.setup(project)[0].to_text()
+            edited = text.replace("a+(b-a)*t", "a+(b-a)*t -- tweaked in pico-8")
+
+            project.unpack(cartmod.Cart.parse(edited))
+
+            self.assertIn("tweaked in pico-8",
+                          _slurp(project.path("src", "lib", "util.lua")))
+            self.assertNotIn("tweaked in pico-8", _slurp(project.path("src", "00.lua")))
+
+    def test_nested_includes(self):
+        with TempProject(make_busy_cart()) as project:
+            _write(project.path("src", "lib", "inner.lua"), "-- inner\n")
+            cart, warnings = self.setup(project, util="-- outer\n#include inner.lua\n")
+            self.assertEqual([], warnings)
+            text = cart.to_text()
+            self.assertIn("-- inner", text)
+            self.assertIn("--#include inner.lua", text)
+
+            project.unpack(cartmod.Cart.parse(text))
+            self.assertEqual("-- outer\n#include inner.lua\n",
+                             _slurp(project.path("src", "lib", "util.lua")))
+            self.assertEqual("-- inner\n", _slurp(project.path("src", "lib", "inner.lua")))
+            self.assertEqual(text, project.pack()[0].to_text())
+
+    def assert_refused(self, project, needle):
+        """A directive we cannot resolve is left alone, and says why."""
+        cart, warnings = project.pack()
+        self.assertTrue(any(needle in w for w in warnings), warnings)
+        self.assertIn("#include", cart.to_text())
+        project.unpack(cartmod.Cart.parse(cart.to_text()))
+        self.assertEqual(cart.to_text(), project.pack()[0].to_text())
+
+    def test_missing_file_warns_and_keeps_the_directive(self):
+        with TempProject(make_busy_cart()) as project:
+            _append(project.path("src", "00.lua"), "\n#include lib/nope.lua\n")
+            self.assert_refused(project, "no such file")
+
+    def test_circular_include_warns_instead_of_hanging(self):
+        with TempProject(make_busy_cart()) as project:
+            _write(project.path("src", "lib", "a.lua"), "#include b.lua\n")
+            _write(project.path("src", "lib", "b.lua"), "#include a.lua\n")
+            _append(project.path("src", "00.lua"), "\n#include lib/a.lua\n")
+            self.assert_refused(project, "includes itself")
+
+    def test_include_may_not_escape_src(self):
+        with TempProject(make_busy_cart()) as project:
+            _write(project.path("secrets.lua"), "-- outside src/\n")
+            _append(project.path("src", "00.lua"), "\n#include ../secrets.lua\n")
+            self.assert_refused(project, "under src/")
+
+    def test_include_may_not_name_a_tab(self):
+        with TempProject(make_busy_cart()) as project:
+            _append(project.path("src", "00.lua"), "\n#include 01.lua\n")
+            self.assert_refused(project, "is a code tab already")
+
+    def test_marker_pointing_outside_src_is_kept_as_text(self):
+        """A hostile cart must not be able to write outside the project."""
+        with TempProject(make_busy_cart()) as project:
+            cart, _ = project.pack()
+            text = cart.to_text().replace(
+                "__gfx__",
+                "--#include ../../evil.lua\npwned\n--#end ../../evil.lua\n__gfx__", 1)
+            warnings = project.unpack(cartmod.Cart.parse(text))
+
+            self.assertTrue(any("does not name a file under src/" in w for w in warnings),
+                            warnings)
+            self.assertFalse(os.path.exists(os.path.join(
+                os.path.dirname(project.root), "evil.lua")))
+            # ...and the text is still there, in whichever tab it landed in.
+            tabs = "".join(_slurp(project.path("src", t))
+                           for t in project.manifest["tabs"])
+            self.assertIn("pwned", tabs)
+            self.assertIn("--#include ../../evil.lua", tabs)
 
 
 class MapAndFlagTests(unittest.TestCase):

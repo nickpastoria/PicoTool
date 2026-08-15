@@ -74,10 +74,33 @@ class Syncer:
             return _sha1(fh.read())
 
     def build(self):
-        """Pack the sources in memory. Returns (text, hash, warnings)."""
+        """Pack the sources in memory. Returns (text, src hash, warnings)."""
         c, warnings = self.project.pack()
         text = c.to_text()
-        return text, _sha1(text), warnings
+        return text, self.src_hash(text), warnings
+
+    def src_hash(self, text):
+        """Hash of everything the source side owns.
+
+        That is the packed cartridge plus every non-tab file under `src/`.
+        Those files are not part of the cart - PICO-8 pulls them in through
+        `#include` as it loads it - so hashing the cart alone would make an
+        edit to a shared library indistinguishable from no edit at all.
+
+        With no such files this is exactly the cart hash, which keeps state
+        written by older versions valid and lets `tick` compare the two sides
+        directly.
+        """
+        parts = []
+        for rel in self.project.include_files():
+            try:
+                with open(self.project.path(rel), "rb") as fh:
+                    parts.append("%s %s" % (rel, _sha1(fh.read())))
+            except OSError:
+                continue
+        if not parts:
+            return _sha1(text)
+        return _sha1("\n".join([_sha1(text)] + parts))
 
     def fingerprint(self):
         """Cheap mtime/size snapshot used to skip work while nothing changes."""
@@ -144,8 +167,9 @@ class Syncer:
             self._backup_sources(self.build()[0])
         except Exception:
             pass
-        self.project.unpack(c)
-        text, src_hash, warnings = self.build()
+        warnings = self.project.unpack(c)
+        text, src_hash, warn = self.build()
+        warnings += warn
         self.save_state(src_hash, self.cart_hash())
         return Result(UNPACKED, ["updated project files from %s" % self.project.manifest["cart"]], warnings)
 
@@ -165,7 +189,7 @@ class Syncer:
 
         # No recorded state yet (fresh clone): trust the sources.
         if not state:
-            if src_hash == cart_hash:
+            if _sha1(text) == cart_hash:
                 self.save_state(src_hash, cart_hash)
                 return Result(IDLE, [], warnings)
             src_moved, cart_moved = True, False
@@ -182,6 +206,14 @@ class Syncer:
             ], warnings)
 
         if src_moved:
+            # A file under src/ moved but the cartridge came out identical, so
+            # no tab includes it. Nothing to write, and nothing worth stealing
+            # the PICO-8 window for.
+            if _sha1(text) == cart_hash:
+                self.save_state(src_hash, cart_hash)
+                return Result(IDLE, [], warnings + [
+                    "a file under src/ changed but the cartridge did not - "
+                    "is it reached by an `#include` from a tab?"])
             self.write_cart(text)
             self.save_state(src_hash, _sha1(text))
             return Result(PACKED, ["built %s" % self.project.manifest["cart"]], warnings)

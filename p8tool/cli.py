@@ -131,7 +131,8 @@ def cmd_unpack(args):
 
     if args.cart:
         source = cartmod.Cart.load(args.cart)
-        project.unpack(source)
+        for w in project.unpack(source):
+            warn(w)
         result = syncer.force_pack()
         out("unpacked %s into %s" % (args.cart, project.root))
         report(result)
@@ -189,6 +190,12 @@ def cmd_status(args):
                             "" if cart_hash else "   (not built yet)"))
     out("tabs      %d  (%s)" % (len(project.manifest["tabs"]),
                                 ", ".join(project.manifest["tabs"]) or "-"))
+    includes = project.include_files()
+    if includes:
+        shown = ", ".join(includes[:4])
+        if len(includes) > 4:
+            shown += ", +%d more" % (len(includes) - 4)
+        out("includes  %d  (%s)" % (len(includes), shown))
 
     src_moved = state.get("src") != src_hash
     cart_moved = cart_hash is not None and state.get("cart") != cart_hash
