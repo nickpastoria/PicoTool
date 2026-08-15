@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "p8tool"
+version = "1.0.0"
+description = "PICO-8 development with version control and external editors"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+p8 = "p8tool.cli:main"
+
+[tool.setuptools]
+packages = ["p8tool"]
