@@ -311,19 +311,22 @@ class Project:
         return c, warnings
 
     def _read_tabs(self):
-        """The tab bodies, with every `#include` inlined. Returns (tabs, warnings)."""
+        """The tab bodies, with every `#include` inlined once. Returns (tabs, warnings)."""
         src = self.path(SRC_DIR)
         files = self._tab_files()
         if not files:
             return [""], []
         out, warnings = [], []
+        # One set for the whole cart: the tabs are concatenated into a single
+        # Lua chunk, so a library reached from two of them belongs in it once.
+        seen = set()
         for name in files:
             body = _read(os.path.join(src, name)).replace("\r\n", "\n")
             if body.endswith("\n"):
                 body = body[:-1]
             body, w = include.expand(body, src, src, _read,
                                      origin=os.path.join(SRC_DIR, name),
-                                     reject=self._reject_include)
+                                     reject=self._reject_include, seen=seen)
             warnings += w
             out.append(body)
         return out, warnings

@@ -19,6 +19,18 @@ becomes, in the built cartridge:
 Unpacking reads those markers in reverse: the body is written back out to
 `src/lib/util.lua` and the region collapses to the one-line directive again.
 
+Each file is inlined at most once per cartridge. PICO-8 tabs are one chunk, so
+a second copy of a library would only redefine what the first copy already
+defined - and a library reached by two different tabs is the normal case, not a
+mistake. Later directives naming a file that is already in the cart become a
+single marker line instead:
+
+    --#included lib/util.lua
+
+which unpacking turns back into `#include lib/util.lua`, without writing the
+file a second time. Order decides which one wins: tabs left to right, lines top
+to bottom, depth first.
+
 Both directions are fixed points - expanding a collapsed tab and collapsing an
 expanded one land exactly where they started - which is what stops the watcher
 ping-ponging. It also means an edit you make *inside* an included region while
@@ -36,6 +48,7 @@ import re
 DIRECTIVE = re.compile(r"^[ \t]*#include[ \t]+(\S.*?)[ \t]*$")
 BEGIN = re.compile(r"^--#include[ \t]+(\S.*?)[ \t]*$")
 END = re.compile(r"^--#end[ \t]+(\S.*?)[ \t]*$")
+AGAIN = re.compile(r"^--#included[ \t]+(\S.*?)[ \t]*$")
 
 TAB_SEPARATOR = "-->8"
 MAX_DEPTH = 16
@@ -63,16 +76,24 @@ def resolve(rel, base_dir, src_root):
     return full if _under(full, src_root) else None
 
 
-def expand(text, base_dir, src_root, read, origin="", reject=None, _stack=()):
+def expand(text, base_dir, src_root, read, origin="", reject=None, seen=None,
+           _stack=()):
     """Inline every `#include` in `text`. Returns (text, warnings).
 
     `read(path)` returns a file's text; `reject(path)` optionally returns a
     reason this file may not be included. Anything that cannot be expanded
     keeps its directive line verbatim - the cart is then slightly wrong, but
     the source survives the round trip intact and the next pack tries again.
+
+    `seen` is the set of files already inlined; a directive naming one of them
+    becomes a `--#included` marker rather than a second copy. Pass the same set
+    to every tab of a cart - the tabs share one Lua chunk, so including a file
+    from two of them would be redefining it, not defining it twice over.
     """
     out, warnings = [], []
     where = "%s: " % origin if origin else ""
+    if seen is None:
+        seen = set()
 
     for line in text.split("\n"):
         m = DIRECTIVE.match(line)
@@ -95,6 +116,13 @@ def expand(text, base_dir, src_root, read, origin="", reject=None, _stack=()):
         elif len(_stack) >= MAX_DEPTH:
             why = "nested more than %d deep" % MAX_DEPTH
 
+        # Already in the cart, and resolvable: leave a marker so unpacking can
+        # put the directive back, and move on. This is the ordinary shape of a
+        # library two tabs both need, so it is not worth a warning.
+        if why is None and os.path.normcase(full) in seen:
+            out.append("--#included %s" % rel)
+            continue
+
         if why is None:
             body = read(full).replace("\r\n", "\n")
             if body.endswith("\n"):
@@ -107,8 +135,9 @@ def expand(text, base_dir, src_root, read, origin="", reject=None, _stack=()):
             out.append(line)
             continue
 
+        seen.add(os.path.normcase(full))
         body, w = expand(body, os.path.dirname(full), src_root, read,
-                         origin=rel, reject=reject,
+                         origin=rel, reject=reject, seen=seen,
                          _stack=_stack + (os.path.normcase(full),))
         warnings += w
 
@@ -140,6 +169,20 @@ def _collapse(lines, i, want_end, base_dir, src_root, write, where, warnings):
         m = END.match(line)
         if m is not None and want_end is not None and _clean(m.group(1)) == want_end:
             return out, i + 1, line
+
+        # A file inlined somewhere else in the cart: restore the directive, and
+        # write nothing - the region that does hold the body owns the file.
+        m = AGAIN.match(line)
+        if m is not None:
+            rel = _clean(m.group(1))
+            if resolve(rel, base_dir, src_root) is None:
+                warnings.append("%skept `%s` as text: it does not name a file under src/"
+                                % (where, line.strip()))
+                out.append(line)
+            else:
+                out.append("#include %s" % rel)
+            i += 1
+            continue
 
         m = BEGIN.match(line)
         if m is None:

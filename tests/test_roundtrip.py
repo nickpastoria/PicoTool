@@ -412,6 +412,78 @@ class IncludeTests(unittest.TestCase):
             self.assertEqual("-- inner\n", _slurp(project.path("src", "lib", "inner.lua")))
             self.assertEqual(text, project.pack()[0].to_text())
 
+    def test_the_same_file_twice_in_one_tab_is_inlined_once(self):
+        with TempProject(make_busy_cart()) as project:
+            cart, warnings = self.setup(
+                project, tab="\n#include lib/util.lua\n#include lib/util.lua\n")
+            text = cart.to_text()
+            self.assertEqual([], warnings)
+            self.assertEqual(1, text.count("function lerp(a,b,t)"))
+            self.assertEqual(1, text.count("--#included lib/util.lua"))
+
+    def test_the_same_file_from_two_tabs_is_inlined_once(self):
+        """Tabs share one Lua chunk, so a library belongs in the cart once."""
+        with TempProject(make_busy_cart()) as project:
+            _append(project.path("src", "01.lua"), "\n#include lib/util.lua\n")
+            cart, warnings = self.setup(project)
+            text = cart.to_text()
+            self.assertEqual([], warnings)
+            self.assertEqual(1, text.count("function lerp(a,b,t)"))
+            # The first tab holds the body; the second only remembers the ask.
+            self.assertEqual(1, text.count("--#include lib/util.lua"))
+            self.assertEqual(1, text.count("--#included lib/util.lua"))
+
+    def test_a_file_reached_two_ways_is_inlined_once(self):
+        """The diamond: two libraries, both needing a third."""
+        with TempProject(make_busy_cart()) as project:
+            _write(project.path("src", "lib", "vec.lua"), "-- vec\n#include util.lua\n")
+            cart, warnings = self.setup(
+                project, tab="\n#include lib/util.lua\n#include lib/vec.lua\n")
+            self.assertEqual([], warnings)
+            self.assertEqual(1, cart.to_text().count("function lerp(a,b,t)"))
+
+    def test_a_skipped_include_survives_the_round_trip(self):
+        with TempProject(make_busy_cart()) as project:
+            _append(project.path("src", "01.lua"), "\n#include lib/util.lua\n")
+            text = self.setup(project)[0].to_text()
+            tab_before = _slurp(project.path("src", "01.lua"))
+            util_before = _slurp(project.path("src", "lib", "util.lua"))
+
+            project.unpack(cartmod.Cart.parse(text))
+
+            # The tab that only got a marker gets its directive back, and the
+            # library keeps the body the other tab is holding.
+            self.assertEqual(tab_before, _slurp(project.path("src", "01.lua")))
+            self.assertEqual(util_before, _slurp(project.path("src", "lib", "util.lua")))
+            self.assertEqual(text, project.pack()[0].to_text())
+
+    def test_edit_next_to_a_skipped_include_still_lands(self):
+        """A marker line is not a region, so what follows it stays in the tab."""
+        with TempProject(make_busy_cart()) as project:
+            _append(project.path("src", "01.lua"), "\n#include lib/util.lua\n")
+            text = self.setup(project)[0].to_text()
+            edited = text.replace("--#included lib/util.lua",
+                                  "--#included lib/util.lua\n-- typed in pico-8")
+
+            project.unpack(cartmod.Cart.parse(edited))
+
+            self.assertIn("-- typed in pico-8", _slurp(project.path("src", "01.lua")))
+            self.assertNotIn("-- typed in pico-8",
+                             _slurp(project.path("src", "lib", "util.lua")))
+
+    def test_skip_marker_pointing_outside_src_is_kept_as_text(self):
+        with TempProject(make_busy_cart()) as project:
+            cart, _ = project.pack()
+            text = cart.to_text().replace(
+                "__gfx__", "--#included ../../evil.lua\n__gfx__", 1)
+            warnings = project.unpack(cartmod.Cart.parse(text))
+
+            self.assertTrue(any("does not name a file under src/" in w for w in warnings),
+                            warnings)
+            tabs = "".join(_slurp(project.path("src", t))
+                           for t in project.manifest["tabs"])
+            self.assertIn("--#included ../../evil.lua", tabs)
+
     def assert_refused(self, project, needle):
         """A directive we cannot resolve is left alone, and says why."""
         cart, warnings = project.pack()

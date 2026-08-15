@@ -139,6 +139,20 @@ the region collapses to the one-line directive again. **Edit a library function
 inside PICO-8 and the change lands in the library file**, not in the tab that
 included it. Both directions are fixed points, so the watcher still settles.
 
+**Each file is inlined at most once per cartridge.** Every tab is part of one Lua
+chunk, so a second copy of a library would only redefine what the first already
+defined — and two tabs needing the same helper is the normal case, not a mistake.
+Later directives naming a file the cart already has become a single marker line:
+
+```lua
+--#included lib/vec.lua
+```
+
+which unpacking turns back into `#include lib/vec.lua`, without writing the file
+a second time. Order decides which directive gets the body: tabs left to right,
+lines top to bottom, depth first. So a diamond — two libraries both pulling in a
+third — is fine, and so is including a helper from every tab that uses it.
+
 Some details worth knowing:
 
 - Includes must resolve to a file under `src/` — that is the tree p8tool watches,
@@ -147,10 +161,8 @@ Some details worth knowing:
 - A file that cannot be resolved — missing, circular, or naming a tab, which is
   already concatenated for you — keeps its directive line untouched and warns.
   Nothing is silently dropped.
-- Including the same file from two tabs inlines it twice, exactly as writing it
-  twice would. There are no include guards.
-- Markers cost two comment lines per include. Comments are free in PICO-8's token
-  budget, and count only against the character limit.
+- Markers cost two comment lines per include, or one for a repeat. Comments are
+  free in PICO-8's token budget, and count only against the character limit.
 - `p8 status` lists the library files it can see.
 
 ### Sprites
