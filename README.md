@@ -45,9 +45,17 @@ cd mygame
 p8 run                  # build, launch PICO-8, sync both ways
 ```
 
-`p8 run` watches everything. Save `src/00.lua` in your editor and PICO-8
-relaunches with the change. Draw a sprite in PICO-8, hit Ctrl-S, and
-`gfx/sprites.png` updates on disk. Commit the result and the diff is readable.
+`p8 run` watches everything. Save `src/00.lua` in your editor and the cart
+reloads inside the PICO-8 window that is already open, so it stays exactly
+where you put it. Draw a sprite in PICO-8, hit Ctrl-S, and `gfx/sprites.png`
+updates on disk. Commit the result and the diff is readable.
+
+The reload works by sending PICO-8 the keys you would press yourself (Escape,
+then Ctrl-R), which means the window is focused for a moment before focus goes
+back to where it was. PICO-8 refuses to reload while it has unsaved changes of
+its own, so save inside PICO-8 first if a reload seems to do nothing. If the
+keystrokes cannot be delivered at all, `p8 run` says so once and falls back to
+restarting PICO-8; `p8 run --relaunch` picks that behaviour deliberately.
 
 | Command | |
 | --- | --- |
@@ -57,7 +65,7 @@ relaunches with the change. Draw a sprite in PICO-8, hit Ctrl-S, and
 | `p8 sync` | Push whichever side changed to the other |
 | `p8 status` | What is out of sync, and where PICO-8 is |
 | `p8 watch` | Sync continuously, without launching PICO-8 |
-| `p8 run` | Build, launch PICO-8, sync continuously, relaunch on code changes |
+| `p8 run` | Build, launch PICO-8, sync continuously, reload the running cart on code changes |
 | `p8 export dist/game.p8.png` | Export through PICO-8 |
 | `p8 tab list` / `p8 tab new <name>` | Manage code tabs |
 | `p8 doctor` | Check the setup and prove a cartridge survives a round trip |
